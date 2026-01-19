@@ -1,0 +1,232 @@
+---
+title: "STAT 452: Predictive Modelling Report"
+author: "Aarushi Bhatnagar (301588428)"
+date: "2025-12-01"
+format:
+  pdf:
+    geometry: "margin=1.0in"
+    fontsize: 12pt
+    code-block-font-size: 9pt
+    code-overflow: wrap
+editor: visual
+echo: false
+---
+
+# Introduction
+
+This project builds a predictive model for estimating the response variable Y using approximately 19 numeric predictors and 20,000 training observations. The dataset was split into 80% training and 20% validation, and all models were evaluated using 10-fold cross-validated RMSE and validation RMSE. After selecting the best model, the final Random Forest was refit on all training data and used to generate test predictions. All steps were reproduced in the accompanying .qmd file using a fixed random seed.
+
+```{r, eval=FALSE}
+# 80/20 train/validation split
+idx <- caret::createDataPartition(train$Y, p = 0.8, list = FALSE)
+train_set <- train[idx, ]
+val_set   <- train[-idx, ]
+```
+
+# Models Evaluated
+
+To identify the best predictive model, I tested six different approaches ranging from simple linear methods to complex ensemble techniques:
+
+## 1. Linear Regression (Baseline)
+
+I used a standard ordinary least squares regression model as a baseline to establish minimum performance expectations. This model assumes a linear relationship between predictors and the response with no regularization and is useful for benchmarking because any substantial improvement from more complex models indicates nonlinearity or interaction effects. After fitting the model, I calculated CV RMSE and validation RMSE.
+
+```{r, eval=FALSE}
+lm_fit <- train(Y ~ ., data = train_set, 
+                method = "lm", 
+                trControl = train_control)
+```
+
+## 2. LASSO Regression
+
+Least Absolute Shrinkage and Selection Operator introduces an L1 regularization that shrinks some coefficients to exactly zero, effectively performing variable selection. I used LASSO to help identify which predictors are most important and can improve prediction accuracy when many predictors are irrelevant. The regularization parameter λ controls the strength of penalization and was selected via 10-fold cross-validation to minimize prediction error. The optimal value chosen by cv.glmnet was λ = 0.00588, which minimized cross-validated MSE.
+
+```{r, eval=FALSE}
+lasso_cv <- cv.glmnet(x = x_train_matrix, 
+                      y = y_train, 
+                      alpha = 1, 
+                      nfolds = 10, 
+                      family = "gaussian")
+optimal_lambda <- lasso_cv$lambda.min
+```
+
+After calculating CV RMSE and validation RMSE, I extracted the non-zero coefficients to determine which variables LASSO retained at the optimal λ. 
+
+```{r, eval=FALSE}
+#to check which variables LASSO kept
+lasso_coefs <- coef(lasso_cv, s = lasso_cv$lambda.min)
+non_zero_coefs <- sum(lasso_coefs[-1] != 0)  # Exclude intercept
+cat("LASSO selected", non_zero_coefs, "non-zero predictors\n")
+
+#non-zero coefficients
+lasso_coef_df <- data.frame(
+  Variable = rownames(lasso_coefs)[-1],
+  Coefficient = as.vector(lasso_coefs[-1])
+) %>% filter(Coefficient != 0)
+```
+
+## 3. Principal Component Regression (PCR)
+
+PCR addresses potential multicollinearity by projecting predictors onto orthogonal principal components before fitting a regression model. The number of components was selected using 10-fold cross-validation.
+
+```{r, eval=FALSE}
+pcr_model <- pcr(Y ~ ., data = train_set, 
+                 scale = TRUE, 
+                 validation = "CV", 
+                 segments = 10)
+```
+
+## 4. Generalized Additive Model (GAM)
+
+GAM allows for non-linear relationships between predictors and the response by fitting smooth spline functions. This provides flexibility to capture non-linear patterns while maintaining some interpretability. Each predictor is fitted with a spline function that can flexibly adapt to the data's curvature. GAM was fitted using the mgcv package, which automatically selects the degree of smoothness for each predictor via restricted maximum likelihood (REML).
+
+I first manually constructed a GAM with smooth spline terms for each predictor to evaluate validation performance, then used the caret package to obtain cross-validated error estimates with automatic hyperparameter tuning.
+
+```{r, eval=FALSE}
+#Manual GAM with splines for validation RMSE
+predictor_names <- names(x_train)
+smooth_terms <- paste0("s(", predictor_names, ", k=5)")
+gam_formula <- as.formula(paste("Y ~", paste(smooth_terms, 
+                                             collapse = " + ")))
+
+gam_model <- gam(gam_formula, 
+                 data = train_set, 
+                 method = "REML")
+
+#GAM via caret for CV RMSE
+gam_fit <- train(Y ~ ., data = train_set, 
+                 method = "gam", 
+                 trControl = train_control)
+```
+
+## 5. Random Forest
+
+Random Forest is an ensemble method that builds multiple decision trees on bootstrapped samples of the training data. Each tree uses only a random subset of predictors at each split (controlled by the mtry parameter), which decorrelates the trees and reduces variance. Random Forest automatically captures complex non-linear relationships and interactions between variables, is robust to outliers, and performs implicit feature selection by down-weighting irrelevant predictors. Given these strengths and the apparent complexity of the dataset, Random Forest was expected to be a strong candidate model.
+
+To optimize performance, I tuned the mtry hyperparameter using 10-fold cross-validation over the grid {3, 5, 7, 9} with 200 trees. The best configuration selected mtry = 9, meaning that 9 out of 19 predictors were considered at each split, which yielded the lowest validation RMSE while remaining computationally efficient.
+
+```{r, eval=FALSE}
+mtry_grid <- c(3, 5, 7, 9)
+
+rf_fit <- train(Y ~ ., data = train_set, 
+                method = "rf", 
+                tuneGrid = data.frame(mtry = mtry_grid), 
+                trControl = train_control, 
+                ntree = 200, 
+                importance = TRUE)
+```
+
+## 6. Gradient Boosting Machine (GBM)
+
+Gradient Boosting Machine (GBM) is a powerful ensemble method that builds trees sequentially, where each new tree is fitted to the residuals (prediction errors) of the previous ensemble. By iteratively correcting errors, GBM often achieves excellent predictive accuracy. However, boosting is prone to overfitting if trees are too complex or the learning rate is too high, requiring careful hyperparameter tuning.
+
+To identify the optimal GBM configuration, I performed exhaustive grid search over four key hyperparameters to optimize GBM performance:
+
+- n.trees: Number of boosting iterations (trees to fit sequentially)
+- interaction.depth: Maximum depth of each tree (controls complexity and interactions)
+- shrinkage: Learning rate that scales each tree's contribution (lower values require more trees but reduce overfitting)
+- n.minobsinnode: Minimum number of observations in terminal nodes (controls tree complexity)
+
+Each combination was fitted using 10-fold cross-validation, and both CV RMSE and validation RMSE were recorded.
+
+```{r, eval=FALSE}
+# Hyperparameter grid
+boost_grid <- expand.grid(n.trees = c(500, 1000, 1500), 
+                          interaction.depth = c(1, 3, 5), 
+                          shrinkage = c(0.01, 0.05), 
+                          n.minobsinnode = c(5, 10))
+
+gbm_fit <- gbm(formula = Y ~ ., data = boost_train, 
+               distribution = "gaussian", 
+               n.trees = params$n.trees, 
+               interaction.depth = params$interaction.depth, 
+               shrinkage = params$shrinkage, 
+               n.minobsinnode = params$n.minobsinnode, 
+               bag.fraction = 0.8, 
+               train.fraction = 1.0, 
+               cv.folds = 10, 
+               verbose = FALSE)
+```
+
+The best combination was:
+
+- n.trees = 1500
+- interaction.depth = 5
+- shrinkage = 0.05
+- n.minobsinnode = 10
+
+This configuration achieved CV RMSE = 4.398. Although strong, this model still did not outperform Random Forest.
+
+# Model Evaluation and Comparison
+
+All models were evaluated using a consistent procedure based on two complementary performance metrics: 10-fold cross-validation RMSE and validation RMSE. The 10-fold CV RMSE provides an estimate of each model’s expected generalization error by repeatedly partitioning the training subset into folds, reducing variance and guarding against overfitting to any one split. Using both CV RMSE and validation RMSE allowed for a robust and fair comparison across models while ensuring that hyperparameter tuning decisions were not influenced by the final evaluation data.
+
+## Model Comparison Results
+
+The performance of all models is summarized in Table 1.
+
+![](Model comparison.png){width=40%} 
+**Table 1: Cross-validation and validation RMSE for all models evaluated**
+
+![](Model comparison 2.png){width=50%}
+**Figure 1: Model Comparison using validation RMSE**
+
+
+According to the results (Figure 1 and Table 1), the Random Forest model achieved the lowest prediction error, with a validation RMSE of 4.05, outperforming every other model considered. Tree-based methods, particularly Random Forest and GBM—substantially outperformed the linear approaches, including Linear Regression, LASSO, and PCR, all of which produced similar RMSE values around 5.18–5.19. This pattern suggests that linear models were unable to capture the nonlinear structure present in the data. GBM performed reasonably well, with a best validation RMSE of approximately 4.31, but still fell short of Random Forest despite extensive hyperparameter tuning. Random Forest also demonstrated excellent internal consistency: its OOB RMSE (4.03) closely matched both the cross-validated RMSE (4.12) and the validation RMSE (4.05), indicating strong generalization and no evidence of overfitting.
+
+Additional insight comes from the LASSO results (Figure 2). Although LASSO selected 16 predictors with non-zero coefficients at the optimal λ = 0.00588,, the majority of these coefficients were extremely small in magnitude, indicating that most predictors contributed minimal linear signal. Only a few variables, most notably X1, and to a lesser extent X13 and X15, had coefficients large enough to be considered meaningful. This pattern aligns with LASSO’s relatively high RMSE and suggests that strong nonlinear interactions may exist in the data, which linear methods such as LASSO cannot adequately capture. 
+
+Taken together, these findings show that Random Forest was not only the most accurate model but also the most robust across all evaluation metrics, making it the clear choice for final prediction.
+
+![](LASSO.png){width=50%}
+**Figure 2: Non-zero LASSO coefficients at optimal $\lambda$ = 0.00588**
+
+# Final Model and Predictions
+
+After identifying Random Forest as the best model, I retrained it on the full training dataset (all 20,000 observations) using the tuned hyperparameters.
+
+```{r, eval=FALSE}
+set.seed(200)
+final_rf <- randomForest(Y ~ ., data = train,
+                         mtry = 9, ntree = 200, 
+                         nodesize = 5, 
+                         importance = TRUE)
+```
+
+# Variable Importance
+
+Variable importance was computed on the final Random Forest model trained on the full dataset. The model’s OOB MSE was 16.09 (OOB RMSE $≈$ 4.01) with approximately 57% of the variance in the response variable. This indicates that the model captures more than half of the underlying signal while maintaining strong generalization performance. Moreover, Random Forest provides two variable importance metrics: (1) %IncMSE and (2) IncNodePurity. I rely on %IncMSE because it directly reflects each variable’s contribution to predictive accuracy.
+
+![](VIP.png){width=50%}
+**Figure 3: Variable Importance Plot**
+
+
+The Random Forest variable importance plot (Figure 3) provides a clear separation between highly informative predictors and a large group of near-zero or noise variables. Based on the %IncMSE measure, the most influential predictors are X11, X13, and X1, with %IncMSE values of 86.7, 81.7, and 63.9 respectively. These variables contribute the largest degradation in model accuracy when removed, indicating that they carry the strongest signal in predicting Y. A secondary tier of moderately important predictors includes X12, X8, X5, X19, X9, and X15, with %IncMSE values ranging from 32 to 48. These variables still provide non-negligible predictive contribution but are clearly less influential than the top three.
+
+In contrast, the remaining predictors: X4, X2, X6, X10, X7, X3, X14, X18, X16, and X17, all have near-zero or even negative %IncMSE values, indicating that permuting them does not meaningfully increase prediction error. Negative values (e.g., X18, X16, X17) suggest that these variables may add noise rather than useful signal. This pattern shows that the model relies heavily on a small subset of predictors, with many variables contributing little to predictive accuracy. Based on the variable importance values, exactly 9 appear to be genuinely influential in the data-generating process, while the remaining variables contribute little or no predictive information. 
+
+# Conclusion
+
+In summary, Random Forest achieved the lowest RMSE among all models and demonstrated the strongest predictive performance. Only a small subset of predictors had substantial influence, consistent with both Random Forest importance scores and LASSO results. The final model was retrained on all available data and used for generating test predictions.
+
+# AI Appendix
+
+
+![Screenshot](AI ss 1.png)
+![Screenshot](AI ss 2.png)
+![Screenshot](AI ss 3.png)
+![Screenshot](AI ss 4.png)
+![Screenshot](AI ss 5.png)
+![Screenshot](AI ss 6.png)
+![Screenshot](AI ss 7.png)
+![Screenshot](AI ss 8.png)
+![Screenshot](AI ss 9.png)
+![Screenshot](AI ss 10.png)
+![Screenshot](AI ss 11.png)
+![Screenshot](AI ss 12.png)
+![Screenshot](AI ss 13.png)
+![Screenshot](AI ss 14.png)
+![Screenshot](AI ss 15.png)
+![Screenshot](AI ss 16.png)
+![Screenshot](AI ss 17.png)
+

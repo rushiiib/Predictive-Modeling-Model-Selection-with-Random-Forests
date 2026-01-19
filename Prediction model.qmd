@@ -1,0 +1,474 @@
+---
+title: "STAT 452: Predictive Modelling Project"
+author: "Aarushi Bhatnagar (301588428)"
+date: "2025-12-01"
+format: html
+editor: visual
+---
+
+```{r}
+set.seed(200)
+
+library(tidyverse)
+library(caret)
+library(mgcv)
+library(glmnet)
+library(randomForest)
+library(pls) 
+
+train <- read.csv("training_data.csv")
+test  <- read.csv("test_predictors.csv")
+
+cat("Training data dimensions:", dim(train), "\n")
+cat("Test data dimensions:", dim(test), "\n")
+
+cat("\nMissing values in training data:", sum(is.na(train)), "\n")
+cat("Missing values in test data:", sum(is.na(test)), "\n")
+
+# 80/20 train/validation split
+idx <- caret::createDataPartition(train$Y, p = 0.8, list = FALSE)
+train_set <- train[idx, ]
+val_set   <- train[-idx, ]
+
+cat("\nTrain set size:", nrow(train_set), "\n")
+cat("Validation set size:", nrow(val_set), "\n")
+
+x_train <- train_set %>% select(-Y)
+y_train <- train_set$Y
+x_val   <- val_set   %>% select(-Y)
+y_val   <- val_set$Y
+
+#cv control (10-fold)
+train_control <- trainControl(
+  method = "cv",
+  number = 10,
+  savePredictions = "final",
+  verboseIter = TRUE
+)
+
+```
+
+```{r}
+set.seed(200)
+
+#Model 1: Linear Regression (baseline model)
+
+lm_fit <- train(
+  Y ~ .,
+  data = train_set,
+  method = "lm",
+  trControl = train_control
+)
+
+# CV RMSE
+lm_cv_rmse <- min(lm_fit$results$RMSE)
+
+# Validation RMSE
+lm_val_pred <- predict(lm_fit, newdata = val_set)
+lm_val_rmse <- sqrt(mean((y_val - lm_val_pred)^2))
+
+cat("Linear Regression CV RMSE:", lm_cv_rmse, "\n")
+cat("Linear Regression Validation RMSE:", lm_val_rmse, "\n")
+
+```
+
+```{r}
+set.seed(200)
+
+#model 2: LASSO
+
+#matrices for glmnet
+x_train_matrix <- as.matrix(x_train)
+x_val_matrix   <- as.matrix(x_val)
+
+lasso_cv <- cv.glmnet(
+  x = x_train_matrix,
+  y = y_train,
+  alpha = 1,
+  nfolds = 10,
+  family = "gaussian"
+)
+
+lasso_cv_rmse <- sqrt(min(lasso_cv$cvm))
+
+cat("LASSO optimal lambda:", lasso_cv$lambda.min, "\n")
+cat("LASSO CV RMSE:", lasso_cv_rmse, "\n")
+
+lasso_val_pred <- predict(lasso_cv, s = lasso_cv$lambda.min, newx = x_val_matrix)
+lasso_val_rmse <- sqrt(mean((y_val - as.vector(lasso_val_pred))^2))
+
+cat("LASSO Validation RMSE:", lasso_val_rmse, "\n")
+
+#to check which variables LASSO kept
+lasso_coefs <- coef(lasso_cv, s = lasso_cv$lambda.min)
+non_zero_coefs <- sum(lasso_coefs[-1] != 0)  # Exclude intercept
+cat("LASSO selected", non_zero_coefs, "non-zero predictors\n")
+
+#non-zero coefficients
+lasso_coef_df <- data.frame(
+  Variable = rownames(lasso_coefs)[-1],
+  Coefficient = as.vector(lasso_coefs[-1])
+) %>% filter(Coefficient != 0)
+
+print(lasso_coef_df)
+
+ggplot(lasso_coef_df, aes(x = reorder(Variable, Coefficient), 
+                          y = Coefficient, fill = Coefficient > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#2c7bb6", "FALSE" = "#d7191c"),
+                    guide = "none") +
+  labs(
+    title = "LASSO Non-Zero Coefficients",
+    x = "Predictor",
+    y = "Coefficient"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+```{r}
+library(randomForest)
+set.seed(200)
+
+#Model 3: Random Forest
+mtry_grid <- c(3, 5, 7, 9)
+
+rf_fit <- train(
+  Y ~ .,
+  data = train_set,
+  method = "rf",
+  tuneGrid = data.frame(mtry = mtry_grid),
+  trControl = train_control,
+  ntree = 200,
+  importance = TRUE
+)
+
+rf_fit
+
+# Best mtry
+best_mtry <- rf_fit$bestTune$mtry
+cat("Random Forest best mtry:", best_mtry, "\n")
+
+# CV RMSE at best mtry
+rf_cv_rmse <- rf_fit$results %>%
+  filter(mtry == best_mtry) %>%
+  pull(RMSE)
+
+cat("Random Forest CV RMSE:", rf_cv_rmse, "\n")
+
+# Validation RMSE
+rf_val_pred <- predict(rf_fit, newdata = val_set)
+rf_val_rmse <- sqrt(mean((y_val - rf_val_pred)^2))
+
+cat("Random Forest Validation RMSE:", rf_val_rmse, "\n")
+
+```
+
+
+```{r}
+set.seed(200)
+
+#Model 4: PCR
+
+pcr_model <- pcr(
+  Y ~ .,
+  data = train_set,
+  scale = TRUE,
+  validation = "CV",
+  segments = 10
+)
+
+cv_scores    <- RMSEP(pcr_model)
+rmse_all     <- cv_scores$val[1, 1, ] 
+rmse_comps   <- rmse_all[-1]          
+optimal_ncomp <- which.min(rmse_comps)
+pcr_cv_rmse   <- rmse_comps[optimal_ncomp]
+
+cat("PCR optimal number of components:", optimal_ncomp, "\n")
+cat("PCR CV RMSE:", pcr_cv_rmse, "\n")
+
+pcr_val_pred <- predict(pcr_model, newdata = val_set, ncomp = optimal_ncomp)
+pcr_val_rmse <- sqrt(mean((y_val - as.vector(pcr_val_pred))^2))
+
+cat("PCR Validation RMSE:", pcr_val_rmse, "\n")
+
+```
+
+```{r}
+set.seed(200)
+library(mgcv)
+
+#Model 5: GAM
+
+#Manual GAM with splines for validation RMSE
+predictor_names <- names(x_train)
+smooth_terms <- paste0("s(", predictor_names, ", k=5)")
+gam_formula <- as.formula(paste("Y ~", paste(smooth_terms, collapse = " + ")))
+
+gam_model <- gam(gam_formula, data = train_set, method = "REML")
+
+gam_val_pred <- predict(gam_model, newdata = val_set)
+gam_val_rmse <- sqrt(mean((y_val - gam_val_pred)^2))
+
+cat("GAM Validation RMSE (manual mgcv):", gam_val_rmse, "\n")
+
+# GAM via caret for CV RMSE
+gam_fit <- train(
+  Y ~ .,
+  data = train_set,
+  method = "gam",        # caret's GAM wrapper (uses mgcv)
+  trControl = train_control
+  # default tunes over 'select' & 'method', as you saw earlier
+)
+
+gam_fit
+
+best_gam <- gam_fit$bestTune
+
+gam_cv_rmse <- gam_fit$results %>%
+  filter(select == best_gam$select,
+         method == best_gam$method) %>%
+  pull(RMSE)
+
+cat("GAM best select/method:", best_gam$select, best_gam$method, "\n")
+cat("GAM CV RMSE:", gam_cv_rmse, "\n")
+
+```
+```{r}
+
+#Model 6: GBM (gradient boosting)
+library(gbm)
+library(tidyverse)
+
+set.seed(200)
+
+# Put X and Y together for gbm (formula interface)
+boost_train <- data.frame(Y = y_train, x_train)
+boost_val   <- data.frame(Y = y_val,   x_val)
+
+# Hyperparameter grid
+boost_grid <- expand.grid(
+  n.trees          = c(500, 1000, 1500),
+  interaction.depth = c(1, 3, 5),
+  shrinkage        = c(0.01, 0.05),
+  n.minobsinnode   = c(5, 10)
+)
+
+boost_results <- boost_grid
+boost_results$CV_RMSE  <- NA_real_
+boost_results$Val_RMSE <- NA_real_
+
+for (i in seq_len(nrow(boost_grid))) {
+  params <- boost_grid[i, ]
+
+  set.seed(200 + i)  # for reproducibility
+  gbm_fit <- gbm(
+    formula = Y ~ .,
+    data    = boost_train,
+    distribution = "gaussian",
+    n.trees = params$n.trees,
+    interaction.depth = params$interaction.depth,
+    shrinkage        = params$shrinkage,
+    n.minobsinnode   = params$n.minobsinnode,
+    bag.fraction     = 0.8,
+    train.fraction   = 1.0,
+    cv.folds         = 10,
+    verbose          = FALSE
+  )
+
+  # Best number of trees from CV
+  best_iter <- gbm.perf(gbm_fit, method = "cv", plot.it = FALSE)
+
+  # CV RMSE
+  cv_rmse <- sqrt(min(gbm_fit$cv.error))
+
+  # Validation RMSE
+  val_pred <- predict(gbm_fit, newdata = boost_val, n.trees = best_iter)
+  val_rmse <- sqrt(mean((y_val - val_pred)^2))
+
+  boost_results$CV_RMSE[i]  <- cv_rmse
+  boost_results$Val_RMSE[i] <- val_rmse
+}
+
+boost_results %>% arrange(Val_RMSE)
+
+best_boost_idx    <- which.min(boost_results$Val_RMSE)
+best_boost_params <- boost_results[best_boost_idx, ]
+
+boost_cv_rmse  <- best_boost_params$CV_RMSE
+boost_val_rmse <- best_boost_params$Val_RMSE
+best_boost_params
+
+
+```
+
+
+```{r}
+set.seed(200)
+#Comparison between models
+
+model_comparison <- tibble(
+  Model = c("Linear Regression", "LASSO", "Random Forest", "PCR", "GAM", "Boosting (GBM)"),
+  CV_RMSE = c(
+    lm_cv_rmse,
+    lasso_cv_rmse,
+    rf_cv_rmse,
+    pcr_cv_rmse,
+    gam_cv_rmse,
+    boost_cv_rmse
+  ),
+  Validation_RMSE = c(
+    lm_val_rmse,
+    lasso_val_rmse,
+    rf_val_rmse,
+    pcr_val_rmse,
+    gam_val_rmse,
+    boost_val_rmse
+  )
+)
+
+formatted_table <- model_comparison %>%
+  arrange(CV_RMSE) %>%
+  mutate(
+    CV_RMSE = round(CV_RMSE, 4),
+    Validation_RMSE = round(Validation_RMSE, 4)
+  )
+
+print(formatted_table)
+
+best_model_idx   <- which.min(model_comparison$CV_RMSE)
+best_model_name  <- model_comparison$Model[best_model_idx]
+best_model_cv_rm <- model_comparison$CV_RMSE[best_model_idx]
+
+cat("\nBest Model by CV_RMSE:", best_model_name, "\n")
+cat("Best Model CV_RMSE:", round(best_model_cv_rm, 4), "\n")
+
+```
+```{r}
+set.seed(200)
+#Bar chart of CV RMSE
+library(ggplot2)
+
+ggplot(model_comparison, aes(x = Model, y = CV_RMSE, fill = Model)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Model Comparison Using CV RMSE",
+    x = "Model",
+    y = "CV RMSE"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    legend.position = "none"
+  )
+
+#Bar chart of Validation RMSE
+ggplot(model_comparison, aes(x = Model, y = Validation_RMSE, fill = Model)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Model Comparison Using Validation RMSE",
+    x = "Model",
+    y = "Validation RMSE"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    legend.position = "none"
+  )
+
+
+```
+
+```{r}
+#refitting entire data using random forest
+
+set.seed(200)
+
+full_x <- train %>% select(-Y)
+full_y <- train$Y
+
+final_rf <- randomForest(
+  x = full_x,
+  y = full_y,
+  ntree = 200,
+  mtry = 9,         #best mtry
+  nodesize = 5,
+  importance = TRUE
+)
+
+print(final_rf)
+test_x <- test   # test predictors only
+test_predictions <- predict(final_rf, newdata = test_x)
+
+#csv file to save predictions
+write.table(test_predictions, "final_predictions.csv", sep = ",", row.names = FALSE, col.names = FALSE)
+
+```
+
+```{r}
+library(tidyverse)
+
+# Get importance measures
+importance_df <- as.data.frame(importance(final_rf))
+importance_df$Variable <- rownames(importance_df)
+
+# Check column names
+print(colnames(importance_df))
+
+# Rename the problematic column
+colnames(importance_df)[colnames(importance_df) == "%IncMSE"] <- "IncMSE"
+
+# Now use without backticks
+importance_df <- importance_df %>% 
+  arrange(desc(IncMSE))
+
+print(importance_df)
+
+# Plot
+ggplot(importance_df, aes(x = reorder(Variable, IncMSE), y = IncMSE)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Variable Importance (Random Forest)",
+    x = "Predictor",
+    y = "% Increase in MSE when variable is permuted"
+  ) +
+  theme_minimal()
+
+# Estimate number of important predictors
+mean_importance <- mean(importance_df$IncMSE)
+important_count <- sum(importance_df$IncMSE > mean_importance)
+
+cat("\nEstimated number of important predictors (above mean importance):", 
+    important_count, "\n")
+```
+
+```{r}
+library(knitr)
+model_comparison <- tibble(
+  Model = c("Random Forest", "Boosting (GBM)", "GAM", 
+            "Linear Regression", "LASSO", "PCR"),
+  `CV RMSE` = c(4.1231, 4.3976, 4.9812, 5.1886, 5.1896, 5.1928),
+  `Validation RMSE` = c(4.0521, 4.3134, 5.0043, 5.1773, 5.1794, 5.1773)
+)
+
+kable(model_comparison, digits = 3, align = 'lcc')
+```
+
+```{r}
+#| label: tbl-importance
+#| tbl-cap: "Top 10 Most Important Variables"
+
+importance_summary <- importance_df %>%
+  select(Variable, IncMSE) %>%
+  arrange(desc(IncMSE)) %>%
+  head(10)
+
+kable(importance_summary, digits = 1, 
+      col.names = c("Variable", "%IncMSE"))
+```
+
+
+
+
